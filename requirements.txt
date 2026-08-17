@@ -1,0 +1,10 @@
+sqlalchemy==2.0.36
+redis==5.0.8
+psycopg2-binary==2.9.9
+xgboost==2.1.1
+scikit-learn==1.5.1
+pandas==2.2.2
+numpy==1.26.4
+joblib==1.4.2
+optuna==3.6.1
+elasticsearch==8.14.0
