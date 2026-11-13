@@ -34,6 +34,15 @@ def _derive_cooked_profile(
     yield_f: float,
     nutrient_retention: dict[str, float] | None = None,
 ) -> dict:
+    """Cooked profile of 100 g of RAW input — the basis ml scales its predictions by.
+
+    100 g raw becomes `100 × yield_f` g cooked. Cooking creates no nutrient, so each nutrient
+    is conserved per raw gram, minus what does not survive (USDA SR28 retention). The mass
+    change is water: lost when yield < 1, absorbed when yield > 1.
+
+    Do not divide by the yield here: ml already converts a cooked weight to its raw
+    equivalent with the same yield, so a per-100 g-cooked target concentrates twice.
+    """
     if yield_f <= 0:
         return dict(raw_profile)
     result = {}
@@ -41,13 +50,10 @@ def _derive_cooked_profile(
         if val is None:
             result[col] = None
         elif col == "water_g":
-            # Water evaporates in absolute terms
             result[col] = max(0.0, val - 100.0 * (1.0 - yield_f))
         else:
-            # Per-100 g nutrients concentrate (yield<1) or dilute (yield>1),
-            # then reduced by the fraction that survives cooking (USDA SR28).
             retention = (nutrient_retention or {}).get(col, 1.0)
-            result[col] = round((val / yield_f) * retention, 4)
+            result[col] = round(val * retention, 4)
     return result
 
 

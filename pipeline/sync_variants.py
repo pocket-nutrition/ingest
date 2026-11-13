@@ -142,11 +142,34 @@ def _confidence_weighted_median(candidates: list[tuple[dict, float]]) -> dict:
     return result
 
 
+# Mapping states that describe an ingredient before cooking, in order of preference. "dry" is the
+# uncooked, as-sold state of shelf-stable foods (rolled oats, pasta, lentils, spices) and is used
+# only when no raw mapping exists, so a fresh ingredient never blends with its dried form.
+_BASE_STATE_METHODS = ("raw", "dry")
+
+
+def _fetch_candidates(session, ing_mappings: list[dict], method: str) -> list[tuple[dict, float]]:
+    """Return (nutrients, confidence) for every mapping of the given cooking_method with source data."""
+    candidates: list[tuple[dict, float]] = []
+    for m in ing_mappings:
+        if m.get("cooking_method", "raw") != method:
+            continue
+        fetcher = _SOURCE_FETCHERS.get(m.get("source", ""))
+        if fetcher is None:
+            continue
+        nutrients = fetcher(session, str(m.get("source_id", "")))
+        if nutrients is None:
+            continue
+        candidates.append((nutrients, float(m.get("confidence") or 1.0)))
+    return candidates
+
+
 def build_nutrient_lookup() -> dict[str, dict]:
     """Return ingredient_id → {nutrient_col: value} from Redis mappings + PG source tables.
 
-    Only raw-state mappings (cooking_method == "raw") are used. When multiple raw mappings
-    exist for the same ingredient, nutrient values are merged via confidence-weighted median.
+    Raw-state mappings are used; "dry" mappings are the fallback when an ingredient has no raw
+    data (see _BASE_STATE_METHODS). When several mappings of the chosen state exist, nutrient
+    values are merged via confidence-weighted median.
     No Elasticsearch I/O — consumed by index_search.run() and embedded into product_search.
     """
     mappings = fetch_mappings()
@@ -170,19 +193,10 @@ def build_nutrient_lookup() -> dict[str, dict]:
     try:
         for ingredient_id, ing_mappings in by_ingredient.items():
             candidates: list[tuple[dict, float]] = []
-            for m in ing_mappings:
-                if m.get("cooking_method", "raw") != "raw":
-                    continue
-                source = m.get("source", "")
-                source_id = str(m.get("source_id", ""))
-                fetcher = _SOURCE_FETCHERS.get(source)
-                if fetcher is None:
-                    continue
-                nutrients = fetcher(session, source_id)
-                if nutrients is None:
-                    continue
-                confidence = float(m.get("confidence") or 1.0)
-                candidates.append((nutrients, confidence))
+            for method in _BASE_STATE_METHODS:
+                candidates = _fetch_candidates(session, ing_mappings, method)
+                if candidates:
+                    break
 
             if candidates:
                 result[ingredient_id] = _confidence_weighted_median(candidates)

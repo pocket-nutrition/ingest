@@ -297,6 +297,51 @@ def test_build_nutrient_lookup_excludes_non_raw_mappings():
     assert session.execute.call_count == 1
 
 
+def test_build_nutrient_lookup_falls_back_to_dry_when_no_raw_mapping():
+    """Shelf-stable foods (rolled oats, pasta, lentils) are only mapped as 'dry' — the uncooked,
+    as-sold state. Without a raw mapping, the dry one is their starting profile."""
+    dry_mapping = {
+        "source": "ciqual", "source_id": "9311",
+        "canonical_ingredient_id": "rolled_oat",
+        "cooking_method": "dry", "confidence": 0.95,
+    }
+    session = _make_session({"proteins_g": 13.5, "energy_kcal": 371.0, "fat_g": 7.0,
+                             "carbohydrates_g": 58.7})
+
+    with (
+        patch("pipeline.sync_variants.fetch_mappings", return_value=[dry_mapping]),
+        patch("pipeline.sync_variants.SessionLocal", return_value=session),
+    ):
+        result = build_nutrient_lookup()
+
+    assert result["rolled_oat"]["energy_kcal"] == pytest.approx(371.0)
+
+
+def test_build_nutrient_lookup_ignores_dry_when_raw_mapping_exists():
+    """A fresh ingredient with both raw and dry mappings keeps the raw profile only."""
+    raw_mapping = {
+        "source": "ciqual", "source_id": "13005",
+        "canonical_ingredient_id": "banana",
+        "cooking_method": "raw", "confidence": 1.0,
+    }
+    dry_mapping = {
+        "source": "ciqual", "source_id": "13089",
+        "canonical_ingredient_id": "banana",
+        "cooking_method": "dry", "confidence": 1.0,
+    }
+    session = _make_session({"proteins_g": 1.1, "energy_kcal": 89.0, "fat_g": 0.3,
+                             "carbohydrates_g": 23.0})
+
+    with (
+        patch("pipeline.sync_variants.fetch_mappings", return_value=[raw_mapping, dry_mapping]),
+        patch("pipeline.sync_variants.SessionLocal", return_value=session),
+    ):
+        result = build_nutrient_lookup()
+
+    assert result["banana"]["energy_kcal"] == pytest.approx(89.0)
+    assert session.execute.call_count == 1
+
+
 def test_build_nutrient_lookup_aggregates_multiple_raw_sources():
     """Two raw mappings → values are merged via confidence-weighted median."""
     mapping_a = {

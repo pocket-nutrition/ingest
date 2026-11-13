@@ -6,8 +6,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pipeline.index_search import (
+    _build_document,
     _build_off_document,
     _build_recipe_document,
+    _build_unit_labels,
     _first_brand,
     _select_curated,
     _stream_off_products_from_db,
@@ -38,6 +40,38 @@ def test_select_curated_preserves_ingredient_dict():
     ingredients = {"rice": {"id": "rice", "food_group": "cereal"}}
     result = _select_curated(ingredients, {"rice"})
     assert result["rice"] == {"id": "rice", "food_group": "cereal"}
+
+
+# ---------------------------------------------------------------------------
+# _build_unit_labels
+# ---------------------------------------------------------------------------
+
+def test_build_unit_labels_both_languages():
+    labels = _build_unit_labels({"unit_label_fr": "c.à.c.", "unit_label_en": "tsp"})
+    by_lang = {lbl["lang"]: lbl["text"] for lbl in labels}
+    assert by_lang == {"fr": "c.à.c.", "en": "tsp"}
+
+
+def test_build_unit_labels_new_language_needs_no_code_change():
+    # Any unit_label_xx key is picked up by prefix, not by an fr/en allowlist — this is the whole
+    # point: a third language is a knowledge-base data change, never a change here.
+    labels = _build_unit_labels({"unit_label_fr": "c.à.c.", "unit_label_es": "cdta."})
+    by_lang = {lbl["lang"]: lbl["text"] for lbl in labels}
+    assert by_lang == {"fr": "c.à.c.", "es": "cdta."}
+
+
+def test_build_unit_labels_skips_absent_or_blank():
+    assert _build_unit_labels({"unit_label_fr": None, "unit_label_en": ""}) == []
+    assert _build_unit_labels({}) == []
+
+
+def test_build_document_embeds_unit_labels():
+    ingredient = {"id": "egg", "unit_label_fr": "oeuf", "unit_label_en": "egg"}
+    doc = _build_document("egg", ingredient, trained_set=set())
+    by_lang = {lbl["lang"]: lbl["text"] for lbl in doc["unit_labels"]}
+    assert by_lang == {"fr": "oeuf", "en": "egg"}
+    assert "unit_label_fr" not in doc
+    assert "unit_label_en" not in doc
 
 
 # ---------------------------------------------------------------------------

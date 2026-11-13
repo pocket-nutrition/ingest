@@ -130,8 +130,16 @@ _MAPPING: dict[str, Any] = {
             "serving_unit_types": {"type": "keyword"},
             "display_unit":       {"type": "keyword"},
             "serving_mode":       {"type": "keyword"},
-            "unit_label_fr":      {"type": "keyword"},
-            "unit_label_en":      {"type": "keyword"},
+            # Nested, like "labels" below, so a new language needs no mapping change — see
+            # _build_unit_labels. Never searched, so text stays a plain keyword rather than an
+            # analyzed field.
+            "unit_labels": {
+                "type": "nested",
+                "properties": {
+                    "lang": {"type": "keyword"},
+                    "text": {"type": "keyword"},
+                },
+            },
             "package_size_ml":    {"type": "float"},
             "package_size_g":     {"type": "float"},
             "serving_size_g":     {"type": "float"},
@@ -191,6 +199,19 @@ def _build_labels(entity: dict[str, Any], fallback_id: str) -> list[dict[str, st
     return labels
 
 
+def _build_unit_labels(entity: dict[str, Any]) -> list[dict[str, str]]:
+    """Build the nested multilingual unit-label array from unit_label_* fields.
+
+    Mirrors _build_labels's prefix-scan: a new language needs only a new `unit_label_xx` key in
+    the knowledge YAML, never a change here or in the API that reads this field.
+    """
+    return [
+        {"lang": key.removeprefix("unit_label_"), "text": value}
+        for key, value in entity.items()
+        if key.startswith("unit_label_") and value
+    ]
+
+
 def _build_document(
     slug: str,
     ingredient: dict[str, Any],
@@ -229,8 +250,7 @@ def _build_document(
         "serving_unit_types": ingredient.get("serving_unit_types") or [],
         "display_unit":       ingredient.get("display_unit"),
         "serving_mode":       ingredient.get("serving_mode"),
-        "unit_label_fr":      ingredient.get("unit_label_fr"),
-        "unit_label_en":      ingredient.get("unit_label_en"),
+        "unit_labels":        _build_unit_labels(ingredient),
         "yield_factors":     yield_factors or {},
         "states":            {k: {kk: vv for kk, vv in v.items() if vv is not None} for k, v in states.items() if isinstance(v, dict)},
         "labels":            labels,

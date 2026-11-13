@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: MPL-2.0
+name: CI
+
+# Contributions: every pull request runs the checks below. Workflows from forks wait for a maintainer to
+# approve them, and they get a read-only token and no secrets.
+# Releases: every commit that lands on main gets a CalVer version (vYYYY.M.N, N restarting at 1 each
+# month), a container image on GHCR and a GitHub Release.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # Pull requests only prove the image still builds; nothing is pushed.
+  image-check:
+    name: Image builds
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # The one check branch protection requires. It fails when any job above failed or was cancelled, and
+  # tolerates skipped jobs (image-check is skipped on pushes to main).
+  ci-success:
+    name: ci-success
+    if: always()
+    needs: [test, image-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if a required job did not succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          case " ${RESULTS} " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
+
+  release:
+    name: Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # Reserves vYYYY.M.N on this commit before building, so the image and the release carry the same
+      # number even when two merges land close together.
+      - name: Reserve CalVer tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "version=$(.github/scripts/calver-reserve.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest
+            type=sha,format=long
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          gh release create "v${VERSION}" --verify-tag --generate-notes --title "v${VERSION}" \
+            --notes "Container image: \`${IMAGE,,}:${VERSION}\`"
+
+      # A tag without a release is clutter: if anything above failed, give the version number back.
+      - name: Release the reserved tag on failure
+        if: failure() && steps.version.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/v${VERSION}"
+          fi

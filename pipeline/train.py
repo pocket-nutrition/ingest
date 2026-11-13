@@ -10,7 +10,6 @@ import joblib
 import numpy as np
 import optuna
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold, train_test_split
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import Pipeline
@@ -49,6 +48,72 @@ def _canonical_group(raw_group: str | None) -> str:
     return stripped if stripped in _KNOWN_GROUPS else "other"
 
 
+_MIN_GROUP_YIELDS = 3
+
+
+def _group_yield_factors(pairs) -> dict[str, dict[str, float]]:
+    """Median known yield per (food_group, cooking_method), for groups with enough data.
+
+    ml falls back to it when a cooked weight must be converted to raw weight and the
+    ingredient has no yield of its own for that method. Keyed by the knowledge food_group
+    string, which is what the API sends as raw_profile.food_group. Theoretical pairs are
+    excluded: their yield already is a group median.
+    """
+    buckets: dict[tuple[str, str], list[float]] = {}
+    for p in pairs:
+        group = (p.food_group or "").strip()
+        if p.is_theoretical or not group or p.yield_f is None or p.yield_f <= 0:
+            continue
+        buckets.setdefault((group, p.cooking_method), []).append(float(p.yield_f))
+
+    result: dict[str, dict[str, float]] = {}
+    for (group, method), values in buckets.items():
+        if len(values) >= _MIN_GROUP_YIELDS:
+            result.setdefault(group, {})[method] = float(np.median(values))
+    return result
+
+
+def _masked_mae(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """Per-target MAE over the rows where the target was measured (NaN truth is skipped).
+
+    A target with no measured row in ``y_true`` gets NaN.
+    """
+    observed = ~np.isnan(y_true)
+    abs_err = np.where(observed, np.abs(np.nan_to_num(y_true) - y_pred), 0.0)
+    counts = observed.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(counts > 0, abs_err.sum(axis=0) / counts, np.nan)
+
+
+def _fit_masked(
+    params: dict,
+    X: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    n_jobs: int = 1,
+) -> MultiOutputRegressor:
+    """Fit one XGBoost regressor per target, each on the rows where that target is measured.
+
+    Imputing missing targets (e.g. with the column median) would teach the model a constant
+    for sparse nutrients. Masking keeps only real observations per target. The result is a
+    plain ``MultiOutputRegressor`` whose ``estimators_`` are set directly, so ml can load
+    and call ``predict()`` on it without any custom class.
+    """
+    estimators = []
+    for j in range(y.shape[1]):
+        observed = ~np.isnan(y[:, j])
+        if not observed.any():
+            raise ValueError(f"target {j} has no measured value — cannot train it")
+        est = XGBRegressor(**params, random_state=42, n_jobs=n_jobs, verbosity=0)
+        est.fit(X[observed], y[observed, j], sample_weight=weights[observed])
+        estimators.append(est)
+
+    model = MultiOutputRegressor(XGBRegressor(**params, random_state=42, n_jobs=n_jobs, verbosity=0))
+    model.estimators_ = estimators
+    model.n_features_in_ = X.shape[1]
+    return model
+
+
 def _optuna_objective(
     trial: optuna.Trial,
     X: np.ndarray,
@@ -62,18 +127,14 @@ def _optuna_objective(
     subsample = trial.suggest_float("subsample", 0.6, 1.0)
     colsample = trial.suggest_float("colsample_bytree", 0.5, 1.0)
     reg_alpha = trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True)
-
-    model = MultiOutputRegressor(XGBRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        subsample=subsample,
-        colsample_bytree=colsample,
-        reg_alpha=reg_alpha,
-        random_state=42,
-        n_jobs=1,
-        verbosity=0,
-    ))
+    params = {
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "learning_rate": learning_rate,
+        "subsample": subsample,
+        "colsample_bytree": colsample,
+        "reg_alpha": reg_alpha,
+    }
 
     n_splits = min(5, len(np.unique(groups)))
     cv = GroupKFold(n_splits=n_splits)
@@ -81,10 +142,9 @@ def _optuna_objective(
     for train_idx, val_idx in cv.split(X, y, groups):
         X_t, X_v = X[train_idx], X[val_idx]
         y_t, y_v = y[train_idx], y[val_idx]
-        model.fit(X_t, y_t, sample_weight=weights[train_idx])
-        y_pred = model.predict(X_v)
-        maes.append(mean_absolute_error(y_v, y_pred, multioutput="uniform_average"))
-    return float(np.mean(maes))
+        model = _fit_masked(params, X_t, y_t, weights[train_idx])
+        maes.append(float(np.nanmean(_masked_mae(y_v, model.predict(X_v)))))
+    return float(np.nanmean(maes))
 
 
 def train_and_export() -> None:
@@ -137,9 +197,10 @@ def train_and_export() -> None:
     # drive the model signal while theoretical pairs still improve generalisation.
     weights = np.where(theoretical_flags, 0.5, 1.0)
 
-    # Impute NaN targets with column median before training.
-    target_imputer = SimpleImputer(strategy="median")
-    cooked_profiles = target_imputer.fit_transform(cooked_raw)
+    # Missing targets stay NaN: each nutrient is trained only on rows where it was measured.
+    target_counts = {col: int((~np.isnan(cooked_raw[:, j])).sum()) for j, col in enumerate(TARGET_COLUMNS)}
+    for col, n in target_counts.items():
+        log.info("Training rows with measured %s: %d", col, n)
 
     ohe_cooking = OneHotEncoder(sparse_output=False, handle_unknown="ignore", categories=[COOKING_METHODS])
     cooking_encoded = ohe_cooking.fit_transform(cooking_methods_raw)
@@ -155,7 +216,7 @@ def train_and_export() -> None:
     raw_scaled = scaler.fit_transform(raw_profiles)
 
     X = np.hstack([raw_scaled, cooking_encoded, foodgroup_encoded])
-    y = cooked_profiles
+    y = cooked_raw
 
     n_trials = int(os.getenv("OPTUNA_TRIALS", "20"))
     log.info("Running Optuna hyperparameter search (%d trials)...", n_trials)
@@ -168,19 +229,13 @@ def train_and_export() -> None:
     best_params = study.best_params
     log.info("Best params: %s  MAE=%.4f", best_params, study.best_value)
 
-    final_model = MultiOutputRegressor(XGBRegressor(
-        **best_params,
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0,
-    ))
     X_train, X_test, y_train, y_test, w_train, _ = train_test_split(
         X, y, weights, test_size=0.1, random_state=42,
     )
-    final_model.fit(X_train, y_train, sample_weight=w_train)
+    final_model = _fit_masked(best_params, X_train, y_train, w_train, n_jobs=-1)
 
     y_pred = final_model.predict(X_test)
-    mae_per_nutrient = mean_absolute_error(y_test, y_pred, multioutput="raw_values")
+    mae_per_nutrient = _masked_mae(y_test, y_pred)
     cv_mae = {col: float(err) for col, err in zip(TARGET_COLUMNS, mae_per_nutrient)}
     for col, err in cv_mae.items():
         log.info("MAE %s: %.4f", col, err)
@@ -224,9 +279,11 @@ def train_and_export() -> None:
         "food_index": food_index,
         "raw_index": raw_index,
         "yield_factors": yield_factors,
+        "group_yield_factors": _group_yield_factors(pairs),
         "known_ingredients": sorted(known_ingredients),
         "plant_ingredient_ids": sorted(plant_ingredient_ids),
         "cv_mae": cv_mae,
+        "target_counts": target_counts,
     }
     MODEL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, MODEL_OUTPUT_PATH)

@@ -60,43 +60,55 @@ def test_normalize_to_raw_basis():
 # transform helpers
 # ---------------------------------------------------------------------------
 
-def test_derive_cooked_profile_reduces_water_and_concentrates_macros():
-    # yield=0.8: food loses 20% mass → per-100g macros concentrate by 1/0.8
+# Training targets are expressed per 100 g of RAW input — the basis ml scales by
+# (raw weight / 100, after converting a cooked weight with the yield). Cooking does not create
+# nutrients, so per raw gram they are conserved (times retention); only water follows the mass
+# change. Concentration per 100 g of cooked food is then recovered by ml via the yield.
+
+def test_derive_cooked_profile_conserves_nutrients_per_raw_gram_and_loses_water():
+    # yield=0.8: 100 g raw becomes 80 g cooked; the 20 g lost is water
     raw = {"energy_kcal": 165.0, "protein_g": 23.0, "water_g": 65.0}
     cooked = _derive_cooked_profile(raw, 0.8)
     assert cooked["water_g"] == pytest.approx(65.0 - 100.0 * 0.2)
-    assert cooked["energy_kcal"] == pytest.approx(165.0 / 0.8)
-    assert cooked["protein_g"] == pytest.approx(23.0 / 0.8)
+    assert cooked["energy_kcal"] == pytest.approx(165.0)
+    assert cooked["protein_g"] == pytest.approx(23.0)
+
+
+def test_derive_cooked_profile_is_per_raw_basis_not_per_cooked():
+    # Guard against re-introducing the per-cooked target (raw / yield): ml already divides
+    # a cooked weight by the yield, so a per-cooked target concentrates nutrients twice.
+    raw = {"energy_kcal": 110.0}
+    assert _derive_cooked_profile(raw, 0.7)["energy_kcal"] != pytest.approx(110.0 / 0.7)
 
 
 def test_derive_cooked_profile_water_clamped_to_zero():
     raw = {"water_g": 5.0, "energy_kcal": 300.0}
     cooked = _derive_cooked_profile(raw, 0.5)
     assert cooked["water_g"] == 0.0
-    assert cooked["energy_kcal"] == pytest.approx(300.0 / 0.5)
+    assert cooked["energy_kcal"] == pytest.approx(300.0)
 
 
-def test_derive_cooked_profile_dilutes_when_yield_above_one():
-    # yield=1.5: food gains mass (e.g. pasta absorbing water) → per-100g macros dilute
+def test_derive_cooked_profile_absorbed_water_when_yield_above_one():
+    # yield=1.5: 100 g dry pasta absorbs 50 g water; nutrients per raw gram are unchanged
     raw = {"energy_kcal": 350.0, "protein_g": 12.0, "water_g": 12.0}
     cooked = _derive_cooked_profile(raw, 1.5)
-    assert cooked["energy_kcal"] == pytest.approx(350.0 / 1.5)
-    assert cooked["protein_g"] == pytest.approx(12.0 / 1.5)
+    assert cooked["water_g"] == pytest.approx(12.0 + 50.0)
+    assert cooked["energy_kcal"] == pytest.approx(350.0)
+    assert cooked["protein_g"] == pytest.approx(12.0)
 
 
 def test_derive_cooked_profile_no_water_key():
-    # No water_g key: only macros are scaled
     raw = {"energy_kcal": 200.0, "protein_g": 10.0}
     cooked = _derive_cooked_profile(raw, 0.7)
-    assert cooked["energy_kcal"] == pytest.approx(200.0 / 0.7, abs=1e-3)
-    assert cooked["protein_g"] == pytest.approx(10.0 / 0.7, abs=1e-3)
+    assert cooked["energy_kcal"] == pytest.approx(200.0)
+    assert cooked["protein_g"] == pytest.approx(10.0)
 
 
 def test_derive_cooked_profile_none_values_preserved():
     raw = {"energy_kcal": 100.0, "vitamin_c_mg": None}
     cooked = _derive_cooked_profile(raw, 0.8)
     assert cooked["vitamin_c_mg"] is None
-    assert cooked["energy_kcal"] == pytest.approx(100.0 / 0.8)
+    assert cooked["energy_kcal"] == pytest.approx(100.0)
 
 
 def test_derive_cooked_profile_zero_yield_returns_raw():
@@ -110,14 +122,14 @@ def test_derive_cooked_profile_applies_retention_factor():
     raw = {"vitamin_c_mg": 28.0, "energy_kcal": 23.0}
     retention = {"vitamin_c_mg": 0.55}
     cooked = _derive_cooked_profile(raw, 0.8375, nutrient_retention=retention)
-    assert cooked["vitamin_c_mg"] == pytest.approx((28.0 / 0.8375) * 0.55, rel=1e-3)
-    assert cooked["energy_kcal"] == pytest.approx(23.0 / 0.8375, rel=1e-3)
+    assert cooked["vitamin_c_mg"] == pytest.approx(28.0 * 0.55, rel=1e-3)
+    assert cooked["energy_kcal"] == pytest.approx(23.0, rel=1e-3)
 
 
 def test_derive_cooked_profile_retention_missing_key_defaults_to_one():
     raw = {"protein_g": 20.0}
     cooked = _derive_cooked_profile(raw, 0.7, nutrient_retention={"vitamin_c_mg": 0.55})
-    assert cooked["protein_g"] == pytest.approx(20.0 / 0.7, rel=1e-3)
+    assert cooked["protein_g"] == pytest.approx(20.0, rel=1e-3)
 
 
 def test_derive_cooked_profile_none_retention_ignored():
