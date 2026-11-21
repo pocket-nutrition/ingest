@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # Reserves the next CalVer tag (vYYYY.M.N) on the commit being built and prints the version
 # (without the leading "v") on stdout. N restarts at 1 every month.
